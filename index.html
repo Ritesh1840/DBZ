@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ultra Instinct</title>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+html,body{width:100%;height:100%;background:#000;overflow:hidden;}
+
+#webcam,#aura-vid,#canvas,#flash{
+  position:absolute;inset:0;width:100%;height:100%;
+}
+#webcam{
+  object-fit:cover;
+  transform:scaleX(-1);
+  z-index:1;
+}
+#aura-vid{
+  z-index:2;
+  mix-blend-mode:screen;
+  opacity:0;
+  object-fit:cover; 
+  pointer-events:none;
+}
+#canvas{
+  z-index:3;
+  pointer-events:none;
+}
+
+#flash{
+  z-index:6;
+  pointer-events:none;
+  background:radial-gradient(ellipse at 50% 35%,
+    rgba(215,230,255,0.95) 0%,
+    rgba(130,170,255,0.35) 45%,
+    transparent 72%);
+  opacity:0;
+}
+
+@keyframes shake{
+  0%,100%{transform:translate(0,0) rotate(0);}
+  20%    {transform:translate(-3px,-2px) rotate(-0.2deg);}
+  50%    {transform:translate(4px,2px)  rotate(0.2deg);}
+  80%    {transform:translate(-2px,3px) rotate(-0.1deg);}
+}
+body.shaking{animation:shake 0.16s ease-in-out;}
+</style>
+</head>
+<body>
+<video id="webcam" autoplay playsinline muted></video>
+<video id="aura-vid" muted loop playsinline src="assets/UI.mp4" width="640" height="360" preload="auto"></video>
+<canvas id="canvas"></canvas>
+<div id="flash"></div>
+
+<script>
+const webcam  = document.getElementById('webcam');
+const auraVid = document.getElementById('aura-vid');
+const canvas  = document.getElementById('canvas');
+const ctx     = canvas.getContext('2d');
+const flash   = document.getElementById('flash');
+const TWO_PI  = Math.PI * 2;
+const FINGER_MCPS=[2,5,9,13,17];
+const HAND_CONN=[
+  [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],
+  [0,9],[9,10],[10,11],[11,12],[0,13],[13,14],[14,15],[15,16],
+  [0,17],[17,18],[18,19],[19,20],[5,9],[9,13],[13,17]
+];
+const HAND_FACES=[
+  [0,1,5],[1,2,5],[2,5,9],[5,6,9],[6,7,9],[7,8,12],[9,10,12],[10,11,12],
+  [0,5,17],[5,9,13],[9,13,17],[13,14,17],[14,15,17],[15,16,20],[17,18,20],[18,19,20]
+];
+
+function toDisplay(lms){
+  const W=window.innerWidth,H=window.innerHeight;
+  const cW=webcam.videoWidth||1280,cH=webcam.videoHeight||720;
+  const sc=Math.max(W/cW,H/cH),ox=(W-cW*sc)/2,oy=(H-cH*sc)/2;
+  return lms.map(l=>[(1-l.x)*cW*sc+ox,l.y*cH*sc+oy]);
+}
+function posePx(lm){
+  const W=window.innerWidth,H=window.innerHeight;
+  const cW=webcam.videoWidth||1280,cH=webcam.videoHeight||720;
+  const sc=Math.max(W/cW,H/cH),ox=(W-cW*sc)/2,oy=(H-cH*sc)/2;
+  return [(1-lm.x)*cW*sc+ox,lm.y*cH*sc+oy];
+}
+function lerp(a,b,t){return a+(b-a)*t;}
+
+let lastPose=null, lastHands=null;
+let uiCharge=0, chargeStart=0, uiActive=false;
+let shakeNext=0, prevTime=performance.now();
+let auraSm={top:0,h:0,w:0,cx:0,ok:false};
+
+function bothHandsRaised(handsRes){
+  const lms=handsRes&&handsRes.multiHandLandmarks;
+  if(!lms||lms.length<2) return false;
+  return lms.every(h=>h[0].y<0.52);
+}
+
+function drawMesh(px){
+  ctx.save();
+  ctx.globalAlpha=0.30; ctx.fillStyle='#000';
+  for(const[a,b,c]of HAND_FACES){
+    ctx.beginPath();
+    ctx.moveTo(px[a][0],px[a][1]);ctx.lineTo(px[b][0],px[b][1]);ctx.lineTo(px[c][0],px[c][1]);
+    ctx.closePath();ctx.fill();
+  }
+  ctx.restore();
+  ctx.save();
+  ctx.strokeStyle='#fff';ctx.lineWidth=1.8;
+  ctx.shadowBlur=9;ctx.shadowColor='rgba(200,220,255,0.85)';
+  for(const[a,b]of HAND_CONN){
+    ctx.beginPath();ctx.moveTo(px[a][0],px[a][1]);ctx.lineTo(px[b][0],px[b][1]);ctx.stroke();
+  }
+  ctx.restore();
+  ctx.save();
+  ctx.fillStyle='#fff';ctx.shadowBlur=7;ctx.shadowColor='rgba(210,225,255,0.9)';
+  for(const pt of px){ctx.beginPath();ctx.arc(pt[0],pt[1],3,0,TWO_PI);ctx.fill();}
+  ctx.restore();
+}
+
+function getBodyBounds(poseLms){
+  const W=window.innerWidth, H=window.innerHeight;
+  if(!poseLms) return {cx:W/2, top:0, bottom:H, shoulderW:W*0.35};
+
+  const tryPts=[0,11,12,23,24,27,28,29,30,31,32];
+  const pts=tryPts.map(i=>poseLms[i]).filter(Boolean).map(l=>posePx(l));
+  if(pts.length<3) return {cx:W/2, top:0, bottom:H, shoulderW:W*0.35};
+
+  let minX=Infinity,maxX=-Infinity,minY=Infinity,maxY=-Infinity;
+  for(const[x,y]of pts){
+    if(x<minX)minX=x; if(x>maxX)maxX=x;
+    if(y<minY)minY=y; if(y>maxY)maxY=y;
+  }
+  const cx=(minX+maxX)/2;
+  const cy=(minY+maxY)/2; 
+  const lSh=posePx(poseLms[11]), rSh=posePx(poseLms[12]);
+  const shoulderW=Math.abs(lSh[0]-rSh[0]);
+  const bodyH = Math.max(maxY - minY, shoulderW * 3.5);
+  const h = bodyH * 1.8;
+  const top = cy - (h * 0.54); 
+  const bottom = top + h;
+
+  return {cx, top, bottom, shoulderW};
+}
+
+function placeAura(poseLms, intensity){
+  const {cx,top,bottom,shoulderW}=getBodyBounds(poseLms);
+  const h=bottom-top;
+  
+  const w=Math.max(shoulderW * 4.8, 400)*(0.8 + intensity * 0.2);
+
+  if(!auraSm.ok){auraSm={top,h,w,cx,ok:true};}
+  else{
+    const a=0.15; 
+    auraSm.cx=lerp(auraSm.cx,cx,a);
+    auraSm.top=lerp(auraSm.top,top,a);
+    auraSm.h=lerp(auraSm.h,h,a);
+    auraSm.w=lerp(auraSm.w,w,a);
+  }
+
+  const aw=Math.round(auraSm.w), ah=Math.round(auraSm.h);
+  const al=Math.round(auraSm.cx-aw/2);
+  const at=Math.round(auraSm.top);
+  const targetOpacity = intensity.toFixed(3);
+
+  auraVid.style.cssText=`
+    position:absolute;
+    left:${al}px; top:${at}px;
+    width:${aw}px; height:${ah}px;
+    z-index:2; mix-blend-mode:screen;
+    opacity:${targetOpacity};
+    pointer-events:none;
+    object-fit:cover; 
+  `;
+}
+
+function shake(){
+  document.body.classList.remove('shaking');
+  void document.body.offsetWidth;
+  document.body.classList.add('shaking');
+  setTimeout(()=>document.body.classList.remove('shaking'),180);
+}
+
+function triggerFlash(){
+  flash.style.transition='none'; flash.style.opacity='1';
+  requestAnimationFrame(()=>{
+    flash.style.transition='opacity 1.4s ease-out';
+    flash.style.opacity='0';
+  });
+}
+
+function frame(){
+  requestAnimationFrame(frame);
+  const now=performance.now();
+  const dt=Math.min((now-prevTime)/1000,0.05); prevTime=now;
+
+  canvas.width=window.innerWidth; canvas.height=window.innerHeight;
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  const poseLms=lastPose&&lastPose.poseLandmarks||null;
+  const handsRes=lastHands||{};
+
+  if(handsRes.multiHandLandmarks&&handsRes.multiHandedness){
+    handsRes.multiHandLandmarks.forEach((lms,i)=>{
+      drawMesh(toDisplay(lms));
+    });
+  }
+
+  const raised=bothHandsRaised(handsRes);
+  if(raised){
+    if(chargeStart===0) chargeStart=now;
+    uiCharge=Math.min(1,(now-chargeStart)/3000);
+  } else {
+    chargeStart=0;
+    uiCharge=Math.max(0,uiCharge-dt*0.9);
+  }
+
+  const wasActive=uiActive;
+  uiActive=uiCharge > 0.001; 
+
+  if(!wasActive&&uiActive){
+    triggerFlash();
+    auraVid.currentTime=0;
+    auraVid.play().catch((err)=>{console.log("Video Play Blocked:", err)});
+  }
+  if(wasActive&&!uiActive){
+    auraVid.pause();
+  }
+
+  if(uiActive&&uiCharge>0.08&&now>shakeNext){
+    shake();
+    shakeNext=now+Math.max(180, 1000-uiCharge*820);
+  }
+
+  if(uiActive){
+    placeAura(poseLms, uiCharge);
+  } else {
+    auraVid.style.opacity='0';
+    auraSm.ok=false;
+  }
+}
+
+(function boot(){
+  const poseMP=new Pose({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}`});
+  poseMP.setOptions({modelComplexity:1,smoothLandmarks:true,minDetectionConfidence:0.55,minTrackingConfidence:0.5});
+  poseMP.onResults(r=>{lastPose=r;});
+
+  const handsMP=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+  handsMP.setOptions({maxNumHands:2,modelComplexity:1,minDetectionConfidence:0.6,minTrackingConfidence:0.5});
+  handsMP.onResults(r=>{lastHands=r;});
+
+  new Camera(webcam,{
+    onFrame:async()=>{
+      await poseMP.send({image:webcam});
+      await handsMP.send({image:webcam});
+    },
+    width:1280,height:720
+  }).start();
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
+
